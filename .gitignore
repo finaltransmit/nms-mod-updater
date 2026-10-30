@@ -1,3 +1,4 @@
 __pycache__/
 *.log
 mod_updater.json
+update_guard.status.json
