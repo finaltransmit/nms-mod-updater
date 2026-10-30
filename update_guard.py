@@ -310,10 +310,11 @@ def _addr_resolve(specs: dict, log, img=None) -> dict:
 ADDRESSES = {
     # cGcPlayer::Update(this, float step): the game-thread tick every mod hooks (its one caller: the simulation's
     # player update, which picks the step with a cmove on the pause state)
+    # (the 2026-10 build pushes one register more, rsi: hence "[0-2]" after push rbx)
     "PLAYER_UPDATE": {"kind": "code", "known": 0x144B3A0,
-                      "prologue": "48 8B C4 48 89 48 ? 55 53 41 54 41 55 41 57 48 8D A8", "sigs": [
-        "48 8B C4 48 89 48 08 55 53 41 54 41 55 41 57 48 8D A8 ? ? ? ? 48 81 EC ? ? ? ? 44 0F 29 40 98 4C 8B F9 "
-        "44 0F 29 48 88 44 0F 28 C1",
+                      "prologue": "48 8B C4 48 89 48 ? 55 53 [0-2] 41 54 41 55 41 57 48 8D A8", "sigs": [
+        "48 8B C4 48 89 48 08 55 53 [0-2] 41 54 41 55 41 57 48 8D A8 ? ? ? ? 48 81 EC ? ? ? ? 44 0F 29 40 98 "
+        "4C 8B F9 44 0F 29 48 88 44 0F 28 C1",
         "0F 44 05 ? ? ? ? 83 F8 04 74 ? 41 0F 28 CA 49 8B CE E8 * * * * 41 B0 01 4C 89 BC 24",
     ]},
     # cTkFSM::StateChange: NMS.py's _INTERNAL_LoadSingletons hooks it to find cGcApplication (gameData.*)
