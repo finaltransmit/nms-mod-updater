@@ -43,6 +43,10 @@ STATUS_FILE = op.join(HERE, "update_guard.status.json")
 # optional masked "prologue", "value": inside "range") and the optional live "check" ("ptr", "vft", "vft:<class>",
 # "u32<N"; a null pointer passes). Nothing found -> 0 and a warning; the caller switches that feature off. Only on
 # the build the "known" values were verified on (180836) is a failed lookup replaced by the known value.
+# Backups for "code" entries, used when the patterns find nothing or disagree (then they pick among the candidates):
+# "vft": ["<class>", <slot>] - the function in that slot of the class's vftable, found through RTTI by the class
+# name (no pattern at all); "nmspy": "<class>::<method>" - NMS.py's own pattern for it (the installed NMS.py, which
+# StartCoop keeps matched to the game). "name" is the function's 4.13 name, for tools/resign.py only.
 import ctypes as _actypes
 import re as _are
 import sys as _asys
@@ -70,7 +74,7 @@ class _AddrImage:
 
     def __init__(self, base: int = 0, path: str = ""):
         import pefile
-        self.base, self._file = base, None
+        self.base, self._file, self._rtti = base, None, {}
         if base:
             head = _addr_peek(base, 0x1000)
             if head is None:
@@ -79,6 +83,7 @@ class _AddrImage:
         else:
             pe = self._file = pefile.PE(path, fast_load=True)
         self.build = (pe.FILE_HEADER.TimeDateStamp, pe.OPTIONAL_HEADER.SizeOfImage)
+        self.image_base = base or pe.OPTIONAL_HEADER.ImageBase  # (what pointers in the data hold)
         self.sections = [(s.Name.rstrip(b"\0").decode(errors="replace"), s.VirtualAddress, s.Misc_VirtualSize,
                           s.Characteristics) for s in pe.sections]
         if base and path:
@@ -253,6 +258,58 @@ def _addr_check(img, spec: dict, v: int):
     return None
 
 
+def _addr_vft(img, cls: str, slot: int) -> int:
+    """RVA of the function in vftable slot `slot` of class `cls` (RTTI: type descriptor -> COL -> vftable), or 0."""
+    key = (cls, slot)
+    if key not in img._rtti:
+        img._rtti[key] = 0
+        secs = {name: (va, size) for name, va, size, _ in img.sections}
+        if ".data" in secs and ".rdata" in secs:
+            dva, dsz = secs[".data"]
+            rva_, rsz = secs[".rdata"]
+            if "_data" not in img._rtti:
+                img._rtti["_data"], img._rtti["_rdata"] = img.read(dva, dsz) or b"", img.read(rva_, rsz) or b""
+            data, rdata = img._rtti["_data"], img._rtti["_rdata"]
+            # pointers in the bytes read: relative to the file's ImageBase when they came from the exe file (also in
+            # the game: read() takes the file for the running build), else to where the image is loaded
+            pbase = img._file.OPTIONAL_HEADER.ImageBase if img._file is not None else img.image_base
+            td = data.find(b".?AV" + cls.encode() + b"@@\0")
+            if td >= 0:
+                td_rva = dva + td - 16
+                for m in _are.finditer(_are.escape(td_rva.to_bytes(4, "little")), rdata):
+                    o = m.start() - 12  # COL: signature 1, offset 0, cdOffset, pTypeDescriptor, ...
+                    if o >= 0 and rdata[o:o + 8] == b"\x01" + b"\0" * 7:
+                        i = rdata.find((pbase + rva_ + o).to_bytes(8, "little"))
+                        if i >= 0:
+                            fn = rdata[i + 8 + 8 * slot:i + 16 + 8 * slot]
+                            if len(fn) == 8:
+                                img._rtti[key] = int.from_bytes(fn, "little") - pbase
+                            break
+    return img._rtti[key]
+
+
+def _addr_nmspy_sig(name: str):
+    """The installed NMS.py's pattern for "<class>::<method>", or None (its source is read, nothing is imported)."""
+    cache = getattr(_asys, "_nms_addr_nmspy_src", None)
+    if cache is None:
+        cache = ""
+        try:
+            import importlib.util
+            import os.path
+            spec = importlib.util.find_spec("nmspy")
+            if spec and spec.origin:
+                with open(os.path.join(os.path.dirname(spec.origin), "data", "types.py"), encoding="utf-8") as f:
+                    cache = f.read()
+        except Exception:
+            pass
+        setattr(_asys, "_nms_addr_nmspy_src", cache)
+    cls, _, meth = name.partition("::")
+    m = _are.search(r"^class " + _are.escape(cls) + r"\(.*?(?=^class |\Z)", cache, _are.M | _are.S)
+    d = m and _are.search(r'function_hook\(\s*(?:signature=)?"([^"]+)"[^\n]*\)\s*\n(?:\s*@\w+[^\n]*\n)*\s*def '
+                          + _are.escape(meth) + r"\(", m.group(0))  # (static ones carry @staticmethod in between)
+    return " ".join("?" if t in ("?", "??") else t for t in d.group(1).split()) if d else None
+
+
 def _addr_lookup(img, spec: dict, env: dict):
     """(value or 0, problem or None, per-pattern notes)."""
     found, notes = set(), []
@@ -266,6 +323,28 @@ def _addr_lookup(img, spec: dict, env: dict):
         notes.append("1" if len(vals) == 1 else f"{len(vals)} values" if vals else "0")
         if len(vals) == 1:
             found |= vals
+    if len(found) != 1 and spec["kind"] == "code":
+        # the backups: a vftable slot by class name, then NMS.py's pattern; each either fills in when nothing was
+        # found or picks one of the disagreeing candidates, and must pass the same checks
+        backups = []
+        if spec.get("vft"):
+            try:
+                backups.append(("vft", _addr_vft(img, spec["vft"][0], spec["vft"][1])))
+            except Exception:
+                backups.append(("vft", 0))
+        if spec.get("nmspy"):
+            sig = _addr_nmspy_sig(spec["nmspy"])
+            try:
+                vals = _addr_scan(img, sig, env) if sig else frozenset()
+            except Exception:
+                vals = frozenset()
+            backups.append(("nmspy", next(iter(vals)) if len(vals) == 1 else 0))
+        for what, v in backups:
+            notes.append(f"{what} {'-' if not v else hex(v)}")
+            if v and (not found or v in found) and not _addr_check(img, spec, v):
+                found = {v}
+                notes.append(f"(by {what})")
+                break
     if not found:
         return 0, "no pattern matched", notes
     if len(found) > 1:
@@ -311,21 +390,21 @@ ADDRESSES = {
     # cGcPlayer::Update(this, float step): the game-thread tick every mod hooks (its one caller: the simulation's
     # player update, which picks the step with a cmove on the pause state)
     # (the 2026-10 build pushes one register more, rsi: hence "[0-2]" after push rbx)
-    "PLAYER_UPDATE": {"kind": "code", "known": 0x144B3A0,
+    "PLAYER_UPDATE": {"kind": "code", "name": "cGcPlayer::Update", "known": 0x144B3A0,
                       "prologue": "48 8B C4 48 89 48 ? 55 53 [0-2] 41 54 41 55 41 57 48 8D A8", "sigs": [
         "48 8B C4 48 89 48 08 55 53 [0-2] 41 54 41 55 41 57 48 8D A8 ? ? ? ? 48 81 EC ? ? ? ? 44 0F 29 40 98 "
         "4C 8B F9 44 0F 29 48 88 44 0F 28 C1",
         "0F 44 05 ? ? ? ? 83 F8 04 74 ? 41 0F 28 CA 49 8B CE E8 * * * * 41 B0 01 4C 89 BC 24",
     ]},
     # cTkFSM::StateChange: NMS.py's _INTERNAL_LoadSingletons hooks it to find cGcApplication (gameData.*)
-    "FSM_STATE_CHANGE": {"kind": "code", "known": 0x2BE4B00,
+    "FSM_STATE_CHANGE": {"kind": "code", "name": "cTkFSM::StateChange", "known": 0x2BE4B00,
                          "prologue": "48 89 6C 24 ? 48 89 74 24 ? 57 48 83 EC ? 4C 8B 51", "sigs": [
         "48 89 6C 24 10 48 89 74 24 18 57 48 83 EC 20 4C 8B 51 08 49 8B E8 4C 8B 1D ? ? ? ? 48 8B F9 48 8B 35 "
         "? ? ? ? 48 89 5C 24 30",
         "44 0F B6 49 30 48 8D 51 18 4C 8B 41 28 E8 * * * * 0F 10 05 ? ? ? ? 48 C7 43 28 00 00 00 00",
     ]},
     # cGcFrontendManager::Activate(this, page, bool): LiveScreen watches it
-    "FRONTEND_ACTIVATE": {"kind": "code", "known": 0x8FE180, "prologue": "40 55 56 57 41 57 48 8B EC", "sigs": [
+    "FRONTEND_ACTIVATE": {"kind": "code", "name": "cGcFrontendManager::Activate", "known": 0x8FE180, "prologue": "40 55 56 57 41 57 48 8B EC", "sigs": [
         "40 55 56 57 41 57 48 8B EC 48 83 EC 58 8B 81 ? ? ? ? 45 0F B6 F8 48 63 F2 48 8B F9 83 F8 04 74 10 85 C0 "
         "74 0C 32 C0 48 83 C4 58 41 5F 5F 5E 5D C3",
         "41 B0 01 BA 09 00 00 00 48 8B C8 E8 * * * * EB 1F 0F 11 80 ? ? ? ? C7 80 ? ? ? ? 09 00 00 00",
