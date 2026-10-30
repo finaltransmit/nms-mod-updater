@@ -139,8 +139,12 @@ class AutoReload(Mod):
         logger.info("AutoReload: %s changed -> reloading %s", op.basename(f), name)
         self._guard_reload_tab(gui)
         try:
-            # Same path the GUI's Reload button takes.
-            mod_manager._gui_reload(None, None, (name, gui))
+            # Same path the GUI's Reload button takes (pyMHF 0.2.4: _gui_reload; 0.2.5 removed it, its button
+            # calls mod_manager.reload(name), which logs its own errors instead of raising).
+            if hasattr(mod_manager, "_gui_reload"):
+                mod_manager._gui_reload(None, None, (name, gui))
+            else:
+                mod_manager.reload(name)
             self.state.reloads += 1
             self.state.last_reloaded = f"{name} @ {time.strftime('%H:%M:%S')}"
             stale = self._purge_stale(name)
